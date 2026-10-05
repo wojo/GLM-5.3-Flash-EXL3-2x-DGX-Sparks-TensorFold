@@ -3,6 +3,19 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased
+
+### Added
+- **Spill tier** (patch `0078-glm-spill-tier`; `SPILL_GIB`, `SPILL_DIR`, `SPILL_HIGHWATER`; off by default): a kept
+  prompt state that leaves the KV pool is written to local disk on each Spark and read back when a later request
+  extends it, also after a clean restart, instead of a new prefill. Past `SPILL_HIGHWATER` (0.70) of the pool the
+  states eviction would take next are written early, in the background, so an eviction frees its rows at once; a
+  restore reads on a background thread while other streams keep decoding. Every read is checked against per-block
+  CRC-32s, and the files are private to you. Prompts with images or video are stored under their pictures'
+  content (`PARALLEL` above 1). It works beside `DISPLAY_KV_MIB` (rows in the display reservation go to and from disk
+  through a kernel, as the pool's own moves there do). Credits in `NOTICE` and `CREDITS.md`.
+  Numbers: README, "Spill tier".
+
 ## v1.7.1 (2026-10-05): a new agent run resumes its system prompt again once the kept cap is full
 
 Image: `v0.6.0-1692d2df78d2` (`sha256:a8067cd7e14c14fa83d1dbed60261428f6d1737cec4554445573354af040dd7c`), 76 patches, for two and three Sparks (v1.7's image plus `0077`).
