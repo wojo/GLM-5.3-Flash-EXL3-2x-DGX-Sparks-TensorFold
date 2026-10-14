@@ -2292,34 +2292,22 @@ section("10 no import per piece", no_import_per_piece)
 
 
 def tp4_guard():
-    """(11, kv-shard-tp4 test branch) Four ranks run; the tp4 prompt paths are refused, and the carry on a ring; the
-    warm-up opens no point-to-point connection when the carry is off (``shard.unsupported``, ``shard.warm``)."""
+    """(11, kv-shard-tp4-exp) Four ranks, the tp4 prompt settings and the carry on a ring all run with the shard; the
+    warm-up opens no point-to-point connection on a ring (the neighbour links are the communicator's own) nor without
+    the carry; the own-row front and microbatching reach the owner's rows through ``forward._sharded_attend``."""
 
     keys = shard.PROMPT_SETTINGS + ("TF_NCCL_RING", "TF_GLM_KV_SHARD_CARRY")
     saved = {k: os.environ.pop(k, None) for k in keys}
     try:
-        check("11 guard: two, three and four ranks run (batched verify, no tp4 prompt settings, no ring)",
-              all(shard.unsupported("batched", n) is None for n in (2, 3, 4)))
+        check("11 guard: two, three and four ranks run", all(shard.unsupported("batched", n) is None for n in (2, 3, 4)))
         check("11 guard: serial verify still refused", shard.unsupported("serial", 4) is not None)
         for k in shard.PROMPT_SETTINGS:
-            for n in (2, 4):
-                os.environ[k] = "1"
-                why = shard.unsupported("batched", n)
-                check(f"11 guard: {k}=1 is refused at {n} ranks, by name", why is not None and k in why)
-                os.environ[k] = "0"
-                check(f"11 guard: {k}=0 is not, at {n} ranks", shard.unsupported("batched", n) is None)
+            os.environ[k] = "1"
+            check(f"11 guard: {k}=1 runs with the shard at four ranks", shard.unsupported("batched", 4) is None)
             os.environ.pop(k)
         os.environ["TF_NCCL_RING"] = "1"
-        why = shard.unsupported("batched", 4)
-        check("11 guard: the carry (default on) on a four-rank ring is refused, naming TF_GLM_KV_SHARD_CARRY",
-              why is not None and "TF_GLM_KV_SHARD_CARRY" in why)
-        os.environ["TF_GLM_KV_SHARD_CARRY"] = "0"
-        check("11 guard: a four-rank ring with the carry off runs", shard.unsupported("batched", 4) is None)
-        os.environ["TF_GLM_KV_SHARD_CARRY"] = "1"
-        check("11 guard: carry 1 on the ring refused again", shard.unsupported("batched", 4) is not None)
+        check("11 guard: the carry on a four-rank ring runs (relayed)", shard.unsupported("batched", 4) is None)
         os.environ.pop("TF_NCCL_RING")
-        check("11 guard: carry on, no ring, four ranks: runs (a switch reaches every pair)",
-              shard.unsupported("batched", 4) is None)
 
         class NoSend:
             nccl = None
@@ -2328,22 +2316,22 @@ def tp4_guard():
                 raise AssertionError(f"warm-up touched the communicator ({name})")
 
         saved_world = shard.WORLD
+
+        def warm_touches():
+            try:
+                shard.warm(NoSend(), "cpu")
+                return False
+            except Exception:
+                return True
         try:
             shard.WORLD = 4
             os.environ["TF_GLM_KV_SHARD_CARRY"] = "0"
-            try:
-                shard.warm(NoSend(), "cpu")
-                ok = True
-            except AssertionError:
-                ok = False
-            check("11 warm-up: with the carry off, four ranks open no point-to-point connection", ok)
+            check("11 warm-up: carry off, four ranks: no point-to-point connection", not warm_touches())
             os.environ["TF_GLM_KV_SHARD_CARRY"] = "1"
-            try:
-                shard.warm(NoSend(), "cpu")
-                touched = False
-            except Exception:
-                touched = True
-            check("11 warm-up: with the carry on it does (the pairs' connections)", touched)
+            os.environ["TF_NCCL_RING"] = "1"
+            check("11 warm-up: carry on, on a ring: none either (the relay uses the neighbour links)", not warm_touches())
+            os.environ.pop("TF_NCCL_RING")
+            check("11 warm-up: carry on, on a switch: the pairs' connections", warm_touches())
         finally:
             shard.WORLD = saved_world
         check("11 guard: the engine passes its rank count",
@@ -2355,6 +2343,155 @@ def tp4_guard():
             else:
                 os.environ[k] = v
 section("11 tp4 guard", tp4_guard)
+
+
+def exp_paths():
+    """(13) The own-row front and microbatching with the shard, checked by structure (their kernels need a GPU)."""
+
+    from tensorfold.families.glm5_next.cuda import forward as fw, own_front as of
+    rest = inspect.getsource(of.rest)
+    check("13 own-front: the owner only writes the chunk's latents into the cache (sharded, not a twin)",
+          "sharded = shard.ON and w.comm is not None and getattr(st, \"twin_base\", None) is None" in rest
+          and "if not sharded or lc is not None:" in rest)
+    check("13 own-front: sharded rows take their tokens from the shared pools, then the owner's rows through "
+          "_sharded_attend with the stream's owner as root",
+          "sparse.pool_tokens(pools[:R], pos_dev, tokens[:R], counts[:R])" in rest and "_sharded_attend(" in rest
+          and "shard.owner(st.base)" in rest)
+    check("13 own-front: the unsharded path is the tp4 one (dense and sparse attention on lc)",
+          "dense_attention(qa[:dense], lc, pos_dev" in rest and "sparse_prompt(qa, lc, tokens[:R], counts[:R], ol, scale)" in rest)
+    att = inspect.getsource(fw._sharded_attend)
+    i, j, k2 = att.find("wait_stream(side)"), att.find("shard.fetch("), att.find("side.wait_stream(")
+    check("13 fetch: ordered with the split's side stream (it waits for the side stream, then the side stream for it)",
+          0 <= i < j < k2)
+    check("13 fetch: the dsa_rows path and the own-row front share it",
+          "_sharded_attend(" in inspect.getsource(fw._sharded_rows))
+    check("13 kernel: sharded prompt rows use the unsharded path's sparse kernel choice (sparse_prompt: TF_GLM_MSA)",
+          "sparse_prompt(qa, att, tok, counts, ol, scale)" in att)
+
+    class B:
+        split = SimpleNamespace(stream="side")
+    check("13 side stream: found on a row-split chunk, none without a split",
+          fw._side_stream(B()) == "side" and fw._side_stream(SimpleNamespace()) is None
+          and fw._side_stream(SimpleNamespace(split=None)) is None)
+section("13 exp paths", exp_paths)
+
+
+class SimRing:
+    """A switchless ring's links for ``relay_rows``: ``links`` as the calling rank sees them (to the next rank: link r,
+    this rank its rank 0; to the previous: link r - 1, its rank 1), and ``lib.ncclAllGather`` as a two-rank mailbox:
+    a call posts its half and takes the partner's if already posted (the sender never needs the receiver's half; the
+    ranks run in path order, so each receive finds its sender's piece). No ncclSend / ncclRecv exist here."""
+
+    def __init__(self, world):
+        import collections
+        self.world, self.box, self.log, self.touched, self.spans = world, collections.defaultdict(collections.deque), [], [], []
+        ring = self
+
+        class AllGather:
+            argtypes = None
+
+            def __call__(self, send, recv, count, dtype, link, stream):
+                import ctypes
+                me = (send - recv) // (count * 4)
+                assert me in (0, 1) and dtype == 2, (me, dtype)
+                for ptr in (send, recv):
+                    if any(lo <= ptr < hi for lo, hi in ring.spans):
+                        ring.touched.append(("allgather", ptr))
+                ring.box[(link, me)].append(ctypes.string_at(send, count * 4))
+                got = bool(ring.box[(link, 1 - me)])
+                if got:
+                    data = ring.box[(link, 1 - me)].popleft()
+                    ctypes.memmove(recv + (1 - me) * count * 4, data, len(data))
+                ring.log.append(("ag", shard.RANK, link, me, count, got))
+                return 0
+
+        self.lib = type("Lib", (), {})()
+        self.lib.ncclAllGather = AllGather()
+
+        def no(*a, **k):
+            raise AssertionError("a point-to-point send or receive on the ring")
+        self.lib.ncclSend = self.lib.ncclRecv = self.lib.ncclBroadcast = no
+
+    @property
+    def links(self):
+        r = shard.RANK
+        return {1: ("L", r), -1: ("L", (r - 1) % self.world)}
+
+    def _check(self, code):
+        assert code == 0
+
+
+def ring_carry_sim(world, src, dst, n, piece=None):
+    ars = sim_arenas(world)
+    before = [[p.tensor.clone() for p in ar.planes] for ar in ars]
+    nc = SimRing(world)
+    for ar in ars:
+        for p in ar.planes:
+            if p.spanned:
+                nc.spans.append((p.tensor.data_ptr(), p.tensor.data_ptr() + p.tensor.numel() * p.tensor.element_size()))
+    saved = (shard._stream, shard._piece, os.environ.get("TF_NCCL_RING"))
+    shard._stream = lambda: 0
+    if piece is not None:
+        shard._piece = lambda rb: piece
+    os.environ["TF_NCCL_RING"] = "1"
+    so, do = shard.owner(src), shard.owner(dst)
+    path = shard.ring_path(so, do, world)
+    try:
+        for r in path + [r for r in range(world) if r not in path]:
+            shard.RANK = r
+            ars[r].carry(src, dst, n, nc)
+    finally:
+        shard._stream, shard._piece = saved[0], saved[1]
+        if saved[2] is None:
+            os.environ.pop("TF_NCCL_RING", None)
+        else:
+            os.environ["TF_NCCL_RING"] = saved[2]
+        shard.RANK = 0
+    return ars, before, nc, path
+
+
+def ring_carry_cases():
+    shard.ON = False
+    try:
+        check("12 ring path: neighbours one hop, the shorter way round, the opposite rank the way up",
+              shard.ring_path(0, 1, 4) == [0, 1] and shard.ring_path(0, 3, 4) == [0, 3] and shard.ring_path(3, 0, 4) == [3, 0]
+              and shard.ring_path(0, 2, 4) == [0, 1, 2] and shard.ring_path(2, 0, 4) == [2, 3, 0]
+              and shard.ring_path(1, 3, 4) == [1, 2, 3] and shard.ring_path(0, 2, 3) == [0, 2] and shard.ring_path(1, 0, 3) == [1, 0])
+        for world, src, dst, n, piece, label in (
+                (4, 2048, SH + 4096, 3001, None, "part 0 to its neighbour 1"),
+                (4, 4096, 2 * SH + 2048, 4097, 513, "part 0 to the opposite part 2 (relayed by rank 1), 513-row pieces"),
+                (4, 2 * SH + 1024, 4096, 2500, 700, "part 2 to the opposite part 0 (the way up: relayed by rank 3)"),
+                (4, 3 * SH, 2048, 2049, None, "part 3 to part 0 across the ring's seam"),
+                (4, SH + 2048, 3 * SH + 4096, 3000, 1000, "part 1 to the opposite part 3 (relayed by rank 2)"),
+                (4, 4096, 3 * SH + 2048, 2000, 7, "part 0 down to part 3, 7 rows a piece"),
+                (3, 4096, 2 * SH + 2048, 3000, 999, "TP3 ring: part 0 to 2, one hop down")):
+            ars, before, nc, path = ring_carry_sim(world, src, dst, n, piece)
+            exp = expected(ars, before, world, src, dst, n)
+            ok = all(bytes_eq(p.tensor, exp[r][k]) for r, ar in enumerate(ars) for k, p in enumerate(ar.planes))
+            check(f"12 ring carry [{label}]: every plane of every rank is the source's rows at the destination, nothing "
+                  f"else touched (relays included)", ok)
+            planes = sum(1 for p in ars[0].planes if p.shard)
+            pieces = -(-n // (piece or n))
+            calls = {r: [e for e in nc.log if e[1] == r] for r in range(world)}
+            want = {r: (0 if r not in path else (1 if r in (path[0], path[-1]) else 2) * planes * pieces) for r in range(world)}
+            check(f"12 ring carry [{label}]: only the path's ranks call ({path}), each hop once a piece and plane "
+                  f"(ends one hop, relays two); no point-to-point", all(len(calls[r]) == want[r] for r in range(world)))
+            recv = [e for e in nc.log if e[5]]
+            check(f"12 ring carry [{label}]: every hop's receiver found its sender's piece ({len(recv)} = hops x pieces x planes)",
+                  len(recv) == (len(path) - 1) * pieces * planes and not any(e[1] == path[0] for e in recv))
+            check(f"12 ring carry [{label}]: the display span is reached only by kernel", not nc.touched)
+        os.environ["TF_NCCL_RING"] = "1"
+        shard.setup(0, 4, 4 * SH)
+        check("12 relayed: a four-rank ring relays, two ranks never do", shard.relayed())
+        shard.setup(0, 2, 2 * SH)
+        check("12 relayed: (two ranks: no)", not shard.relayed())
+        os.environ.pop("TF_NCCL_RING")
+        shard.setup(0, 4, 4 * SH)
+        check("12 relayed: four ranks on a switch send straight", not shard.relayed())
+    finally:
+        os.environ.pop("TF_NCCL_RING", None)
+        shard.setup(0, 2, 4096 * 512)
+section("12 ring carry", ring_carry_cases)
 print("FAILED" if fails else "ALL PASS", len(fails))
 sys.stdout.flush()
 os._exit(1 if fails else 0)

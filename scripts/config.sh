@@ -191,16 +191,18 @@ export TF_GLM_HC_SPLIT="$SPLIT" TF_GLM_PREFILL_OVERLAP="$([[ "$SPLIT" == 1 ]] &&
 # ring) 8k 2,271 -> 2,313 tok/s, 32k 2,243 -> 2,329, 131k 2,110 -> 2,288 (one boot each). Off at two and three until
 # measured there: 1 to try it.
 _tp4=0; [[ "$TP" == 4 ]] && _tp4=1
-# TEST BRANCH kv-shard-tp4 (#152): with TF_GLM_KV_SHARD=1 (export it in scripts/local.sh), the prompt paths patch
-# 0118 is not ported to are off, whatever TP=4 defaults to below: the own-row front and microbatching (the engine
-# refuses them with the shard). At three Sparks or more the carry is off too unless TF_GLM_KV_SHARD_CARRY=1 is set,
-# which the engine refuses on a switchless ring. Unsharded runs keep the tp4 defaults. TESTING-KV-SHARD-TP4.md has the
-# test plan.
-if [[ "${TF_GLM_KV_SHARD:-0}" == 1 ]]; then
+# EXPERIMENT BRANCH kv-shard-tp4-exp (#152): with TF_GLM_KV_SHARD=1 the tp4 defaults stay on: the own-row prompt front,
+# microbatching and (relayed over the neighbour links on a switchless ring) the carry. TF_GLM_KV_SHARD_SAFE=1 runs the
+# kv-shard-tp4 test branch's settings instead (own-front, microbatch and, at three Sparks or more, the carry off), for an
+# A/B against them. TESTING-KV-SHARD-TP4.md has the plan.
+if [[ "${TF_GLM_KV_SHARD:-0}" == 1 && "${TF_GLM_KV_SHARD_SAFE:-0}" == 1 ]]; then
   export TF_GLM_PROMPT_OWN_FRONT=0 TF_GLM_PROMPT_MICROBATCH=0
   (( TP > 2 )) && export TF_GLM_KV_SHARD_CARRY="${TF_GLM_KV_SHARD_CARRY:-0}"
-  [[ -n "${_kvshard_noted:-}" ]] || echo "[config] TF_GLM_KV_SHARD=1 (test branch kv-shard-tp4): TF_GLM_PROMPT_OWN_FRONT=0," \
+  [[ -n "${_kvshard_noted:-}" ]] || echo "[config] TF_GLM_KV_SHARD_SAFE=1: TF_GLM_PROMPT_OWN_FRONT=0," \
     "TF_GLM_PROMPT_MICROBATCH=0, TF_GLM_KV_SHARD_CARRY=${TF_GLM_KV_SHARD_CARRY:-1}" >&2
+  export _kvshard_noted=1
+elif [[ "${TF_GLM_KV_SHARD:-0}" == 1 && -z "${_kvshard_noted:-}" ]]; then
+  echo "[config] TF_GLM_KV_SHARD=1 (experiment branch kv-shard-tp4-exp): own-front, microbatch and the carry as configured" >&2
   export _kvshard_noted=1
 fi
 export TF_GLM_PROMPT_OWN_FRONT="$([[ "$SPLIT" == 1 ]] && echo "${TF_GLM_PROMPT_OWN_FRONT:-$_tp4}" || echo 0)"
