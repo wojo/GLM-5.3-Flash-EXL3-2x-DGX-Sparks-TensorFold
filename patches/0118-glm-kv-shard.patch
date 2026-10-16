@@ -1,5 +1,5 @@
-# EXPERIMENT BRANCH kv-shard-tp4-exp (#152): 0118 on upstream's tp4 branch with the own-row prompt front, microbatching
-# and the carry on a switchless ring (relayed over the neighbour links) running with the shard. Untested on GPUs.
+# EXPERIMENT BRANCH kv-shard-tp4-exp (#152): 0118 on upstream's tp4 branch, the same shard core as main, with the own-row
+# prompt front, microbatching and a carry relayed over a switchless ring's neighbour links. Tested on four Sparks (a ring).
 # KV sharding (TF_GLM_KV_SHARD=1, --parallel above 1, two ranks or more): each conversation's latent cache stored
 # once, on its owner, instead of on every rank (~1.88x the tokens in the same memory at two ranks). Decode: the owner
 # computes every head of its rows (queries gathered, the other ranks' heads sent back). Prompts: the owner sends only
