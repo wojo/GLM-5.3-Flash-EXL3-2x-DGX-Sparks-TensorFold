@@ -2348,25 +2348,32 @@ section("11 tp4 guard", tp4_guard)
 def exp_paths():
     """(13) The own-row front and microbatching with the shard, checked by structure (their kernels need a GPU)."""
 
-    from tensorfold.families.glm5_next.cuda import forward as fw, own_front as of
-    rest = inspect.getsource(of.rest)
-    check("13 own-front: the owner only writes the chunk's latents into the cache (sharded, not a twin)",
-          "sharded = shard.ON and w.comm is not None and getattr(st, \"twin_base\", None) is None" in rest
-          and "if not sharded or lc is not None:" in rest)
-    check("13 own-front: sharded rows take their tokens from the shared pools, then the owner's rows through "
-          "_sharded_attend with the stream's owner as root",
-          "sparse.pool_tokens(pools[:R], pos_dev, tokens[:R], counts[:R])" in rest and "_sharded_attend(" in rest
-          and "shard.owner(st.base)" in rest)
-    check("13 own-front: the unsharded path is the tp4 one (dense and sparse attention on lc)",
-          "dense_attention(qa[:dense], lc, pos_dev" in rest and "sparse_prompt(qa, lc, tokens[:R], counts[:R], ol, scale)" in rest)
+    from tensorfold.families.glm5_next.cuda import forward as fw
+    try:                                     # (the tp4 branch's own-row front; main has none)
+        from tensorfold.families.glm5_next.cuda import own_front as of
+    except ImportError:
+        of = None
+    rest = inspect.getsource(of.rest) if of is not None else None
+    if rest is not None:
+        check("13 own-front: the owner only writes the chunk's latents into the cache (sharded, not a twin)",
+              "sharded = shard.ON and w.comm is not None and getattr(st, \"twin_base\", None) is None" in rest
+              and "if not sharded or lc is not None:" in rest)
+        check("13 own-front: sharded rows take their tokens from the shared pools, then the owner's rows through "
+              "_sharded_attend with the stream's owner as root",
+              "sparse.pool_tokens(pools[:R], pos_dev, tokens[:R], counts[:R])" in rest and "_sharded_attend(" in rest
+              and "shard.owner(st.base)" in rest)
+        check("13 own-front: the unsharded path is the tp4 one (dense and sparse attention on lc)",
+              "dense_attention(qa[:dense], lc, pos_dev" in rest and "sparse_prompt(qa, lc, tokens[:R], counts[:R], ol, scale)" in rest)
     att = inspect.getsource(fw._sharded_attend)
     i, j, k2 = att.find("wait_stream(side)"), att.find("shard.fetch("), att.find("side.wait_stream(")
     check("13 fetch: ordered with the split's side stream (it waits for the side stream, then the side stream for it)",
           0 <= i < j < k2)
     check("13 fetch: the dsa_rows path and the own-row front share it",
           "_sharded_attend(" in inspect.getsource(fw._sharded_rows))
-    check("13 kernel: sharded prompt rows use the unsharded path's sparse kernel choice (sparse_prompt: TF_GLM_MSA)",
-          "sparse_prompt(qa, att, tok, counts, ol, scale)" in att)
+    sp = inspect.getsource(fw._shard_sparse)
+    check("13 kernel: sharded rows use the unsharded path's sparse kernel choice (sparse_prompt where the base has it)",
+          "_shard_sparse(qa, att, tok, counts, ol, scale, b.prefill)" in att and 'globals().get("sparse_prompt")' in sp
+          and "latent.SPARSE_ONEPASS" in sp)
 
     class B:
         split = SimpleNamespace(stream="side")
@@ -2483,6 +2490,9 @@ def ring_carry_cases():
         os.environ["TF_NCCL_RING"] = "1"
         shard.setup(0, 4, 4 * SH)
         check("12 relayed: a four-rank ring relays, two ranks never do", shard.relayed())
+        check("12 relayed: only over a communicator with the ring links (main's has none: direct sends, as before)",
+              shard.relayed(SimpleNamespace(links={1: "next", -1: "prev"})) and not shard.relayed(SimpleNamespace())
+              and not shard.relayed(SimpleNamespace(links={})))
         shard.setup(0, 2, 2 * SH)
         check("12 relayed: (two ranks: no)", not shard.relayed())
         os.environ.pop("TF_NCCL_RING")

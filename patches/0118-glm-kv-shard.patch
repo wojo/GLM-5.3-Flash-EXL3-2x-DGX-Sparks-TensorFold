@@ -268,7 +268,7 @@
      if sparse_np is not None:
          raise ValueError("sparse CUDA graphs need the latent cache (TF_GLM_LATENT=1)")
      mm(b, b.lat[:R], a.kv_k, b.xs_lat[:R], b.kn[:R].view(R, HL * c.qk_dim))
-@@ -655,15 +670,97 @@
+@@ -655,15 +670,111 @@
  
  
  def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
@@ -356,12 +356,26 @@
 +                            hb=latent.head_block(R), starts=b.att_starts if b.prefill else None)
 +    if sparse_rows:
 +        with prof.timed("dsa: sparse attention"):
-+            if b.prefill:                        # the unsharded path's kernel (TF_GLM_MSA, else sparse_onepass): a row's
-+                sparse_prompt(qa, att, tok, counts, ol, scale)   # bits depend on its query, tokens and keys only
-+            else:
-+                latent.sparse_attention(qa, att, tok, counts, ol, scale)
++            _shard_sparse(qa, att, tok, counts, ol, scale, b.prefill)
  
  
++def _shard_sparse(qa, att, tok, counts, ol, scale, prefill: bool) -> None:
++    """The sharded rows' sparse attention with the unsharded path's kernel choice, so both give the same bits: a prompt
++    chunk through ``sparse_prompt`` where the base has it (tp4: TF_GLM_MSA, else sparse_onepass), else sparse_onepass
++    with TF_GLM_SPARSE_ONEPASS (main); a decode window through sparse_attention. A row's bits depend on its query, its
++    tokens and the keys only, so the owner's cache and the other ranks' compact copy agree."""
++
++    if prefill:
++        f = globals().get("sparse_prompt")
++        if f is not None:
++            f(qa, att, tok, counts, ol, scale)
++            return
++        if latent.SPARSE_ONEPASS:
++            latent.sparse_onepass(qa, att, tok, counts, ol, scale)
++            return
++    latent.sparse_attention(qa, att, tok, counts, ol, scale)
++
++
  def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
 -             index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1, lo: int = 0) -> torch.Tensor:
 +             index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1, lo: int = 0,
@@ -369,7 +383,7 @@
      """``_dsa_latent`` up to its output projection, for rows lo .. lo + R of the buffers (their front done) on one
      stream's caches (``lc``, ``index``, ``pos_dev``, ``host_pos``: its first row's position): the latent write,
      indexer update, absorb, attention and expand; returns the rows' attention output [R, heads * v_dim] (b.vn's rows).
-@@ -674,8 +771,10 @@
+@@ -674,8 +785,10 @@
      HL = a.heads
      s = b.lat_s
      rs = slice(lo, lo + R)
@@ -382,7 +396,7 @@
      # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
      all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
      sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
-@@ -691,6 +790,14 @@
+@@ -691,6 +804,14 @@
      l2pf.site(layer, "o")
      ol = s.ol[rs]
      scale = c.qk_dim ** -0.5
@@ -397,23 +411,21 @@
      if not all_sparse:
          # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
          # and only the rows before it (a row's dense bits do not depend on the rows after it: latent.attention).
-@@ -722,8 +829,15 @@
-         latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
-     else:
+@@ -724,6 +845,13 @@
          latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
-+
-+
+ 
+ 
 +class _Lat:
 +    """A decode window's latent write targets (``latent.seg_latent_write`` reads ``pos`` and ``base``)."""
- 
++
 +    def __init__(self, pos, base) -> None:
 +        self.pos, self.base = pos, base
- 
++
 +
  def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
                   select: bool = True) -> torch.Tensor | None:
      """dsa_block on the latent cache for a multi-stream window (``rows``: segments.SegRows, already set): several
-@@ -743,8 +857,9 @@
+@@ -743,8 +871,9 @@
      HL = a.heads
      mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
      s = b.lat_s
@@ -425,7 +437,7 @@
      tokens = counts = None
      if index is not None:
          ik, ig, pk = index
-@@ -761,7 +876,10 @@
+@@ -761,7 +890,10 @@
          qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
      l2pf.site(layer.index, "o")
      with prof.timed("dsa: attention"):
@@ -437,7 +449,7 @@
      with prof.timed("dsa: expand"):
          o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
      return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
-@@ -860,7 +978,9 @@
+@@ -860,7 +992,9 @@
      di = st.dsa_index[layer.index]
      with prof.timed("dsa (total)"):
          return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
@@ -1689,7 +1701,7 @@
 +        if so == do:                         # one part: no rows to send
 +            return self.copy(src, dst, n)
 +        nc = getattr(comm, "nccl", comm)
-+        relay = shard.relayed()            # a switchless ring: hop by hop over the neighbour links, every rank between
++        relay = shard.relayed(nc)          # a switchless ring: hop by hop over the neighbour links, every rank between
 +        for p in self.planes:              # the two owners passing each piece on (``shard.relay_rows``)
 +            if not p.shard:
 +                a, b = src // p.div, dst // p.div
@@ -2007,7 +2019,7 @@
              t[o + s] = r
 --- /dev/null
 +++ tensorfold/families/glm5_next/cuda/shard.py
-@@ -0,0 +1,645 @@
+@@ -0,0 +1,644 @@
 +"""TF_GLM_KV_SHARD=1 (two ranks or more, --parallel above 1): the latent cache stored once instead of on every rank.
 +
 +The pool's rows are split in parts, one a rank (two halves at two ranks): an extent lives in one part
@@ -2044,11 +2056,11 @@
 +With the display reservation (TF_GLM_DISPLAY_KV_MIB) the first latent planes, each a half and its trash rows long, are
 +carved from its span as unsharded (the pool's rows count its bytes at a sharded token's cost). Not with
 +TF_GLM_MULTI_LONE, TF_GLM_MULTI_VERIFY=serial or one rank (refused at start: ``unsupported``).
-+EXPERIMENT BRANCH (kv-shard-tp4-exp, #152): on top of the kv-shard-tp4 test branch, the tp4 branch's own-row prompt
-+front and microbatching run with the shard (its attention through the owner's fetched rows, the fetch ordered with the
-+split's side stream), and the carry runs on a switchless ring, relayed hop by hop over the neighbour links
-+(``relay_rows``). Past two ranks none of this has run on hardware yet: the CPU checks cover the pool's parts,
-+placement, twins, the guard and the ring relay."""
++The same code serves main and the tp4 branch (#152). On tp4 its own-row prompt front and microbatching run with the
++shard (``own_front.rest`` through ``forward._sharded_attend``, the fetch ordered with the split's side stream), and on
++a switchless ring the carry is relayed hop by hop over the neighbour links (``relay_rows``); without those links
++(main) a carry goes straight from owner to owner. Tested on two Sparks (main) and on four on a ring (tp4); three are
++untested on hardware."""
 +
 +from __future__ import annotations
 +
@@ -2157,8 +2169,8 @@
 +                  f"{effective} tokens ({max_rows} rows of a part are a decode window's)")
 +
 +
-+# Settings of upstream's tp4 branch (four Sparks) the kv-shard-tp4 test branch turns off with the shard; here they run
-+# with it (the own-row front's attention goes through ``forward._sharded_attend``).
++# The tp4 branch's prompt settings: they run with the shard (the own-row front's attention through
++# ``forward._sharded_attend``); main has neither.
 +PROMPT_SETTINGS = ("TF_GLM_PROMPT_OWN_FRONT", "TF_GLM_PROMPT_MICROBATCH")
 +
 +
@@ -2175,9 +2187,7 @@
 +
 +
 +def unsupported(verify: str, world: int = 2) -> str | None:
-+    """Why the shard cannot run with TF_GLM_MULTI_VERIFY=``verify`` on ``world`` ranks (None: it can).
-+    EXPERIMENT BRANCH (kv-shard-tp4-exp): four ranks, the own-row prompt front, microbatching and the carry on a ring
-+    all run with the shard (``own_front.rest``, ``forward._sharded_attend``, ``relay_rows``)."""
++    """Why the shard cannot run with TF_GLM_MULTI_VERIFY=``verify`` on ``world`` ranks (None: it can)."""
 +
 +    if verify == "serial":
 +        return ("TF_GLM_KV_SHARD=1 does not run with TF_GLM_MULTI_VERIFY=serial: the one-stream graphs it replays are "
@@ -2491,9 +2501,9 @@
 +    and allocates buffers). The pairs go in the same order on every rank (a < b, by a then b): a sends first and
 +    receives, b receives first and sends, so each call meets its partner's; a rank outside a pair goes on to the next."""
 +
-+    if WORLD < 3 or not carry_on() or ring():   # (only the carry sends point to point past two ranks, and on a ring it
-+        return                                   # goes over the neighbour links the communicator opened at start)
 +    nc = getattr(comm, "nccl", comm)
++    if WORLD < 3 or not carry_on() or relayed(nc):   # (only the carry sends point to point past two ranks, and on a
++        return                                       # ring it goes over the neighbour links opened at start)
 +    stream = _stream()
 +    out = torch.zeros((1, 16), dtype=torch.uint8, device=device)
 +    got = torch.empty((1, 16), dtype=torch.uint8, device=device)
@@ -2547,12 +2557,13 @@
 +        put_rows(rows[i:i + k], buf[:k], spanned)
 +
 +
-+def relayed() -> bool:
-+    """Whether a carry goes round the ring (TF_NCCL_RING=1, three ranks or more) instead of straight to the destination:
-+    on a switchless ring each rank reaches only its neighbours, and even a neighbour's point-to-point send may land on
-+    a port without the peer, so every hop is a two-rank all-gather on the cabled link (``comm._open_links``)."""
++def relayed(nc=None) -> bool:
++    """Whether a carry goes round the ring (TF_NCCL_RING=1, three ranks or more, and a communicator that opened the
++    neighbour links: the tp4 branch's ``comm._open_links``) instead of straight to the destination: on a switchless
++    ring each rank reaches only its neighbours, and even a neighbour's point-to-point send may land on a port without
++    the peer, so every hop is a two-rank all-gather on the cabled link. A base without the links (main) never relays."""
 +
-+    return WORLD > 2 and ring()
++    return WORLD > 2 and ring() and (nc is None or bool(getattr(nc, "links", None)))
 +
 +
 +def ring_path(so: int, do: int, world: int | None = None) -> list[int]:
