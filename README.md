@@ -25,6 +25,11 @@
 > | **Full pool on the first start of a new image** (`0119`) | [#149](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/149) | budget 94.6 GiB instead of 89.4 (the first start used to lose 5-9 GiB of it) |
 > | **A rewound conversation keeps its id** (`0111`), so per-conversation limits count it once | [#128](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/128) | |
 >
+> **Four Sparks** (upstream's `tp4` branch): the same sharding code, ported, is on
+> [`kv-shard-tp4-exp`](https://github.com/wojo/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/kv-shard-tp4-exp),
+> tested by @SvangenStudios on a four-Spark switchless ring: ~3.4x the pool (about 20M tokens at a 1M window), byte-equal
+> replies, own-front, microbatching and a ring-relayed carry all on.
+>
 > **Switching from upstream:** clone this repository, copy your `scripts/local.sh` (and `.env`) across, and run
 > `./start.sh`. The first start builds the image locally (no image is published for this patch set). Spill needs
 > about 64 GiB free on each Spark's NVMe, plus 50 GiB it always leaves free (`SPILL_GIB=0` turns it off;
